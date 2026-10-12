@@ -534,7 +534,10 @@ Panel {
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: "j/k move   Tab/1-4 section   Enter/o open   c copy   a ask   e edit   r run   m done   Esc close"
+            // non-breaking space inside each pair, so a wrap never strands a key from its label
+            text: [["j/k", "move"], ["Tab/1-4", "section"], ["Enter/o", "open"], ["c", "copy"], ["a", "ask"],
+                   ["e", "edit"], ["r", "run"], ["m", "done"], ["Esc", "close"]]
+              .map(function(p) { return p[0] + "\u00a0" + p[1] }).join("   ")
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
