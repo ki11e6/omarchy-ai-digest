@@ -497,4 +497,57 @@ assert.strictEqual(D.freshness(NOW + minutes(5), NOW), "just now", "clock skew c
   assert.ok(D.helpRows().some(r => r.key === "/" && r.kind === "key"), "help lists the keys")
 }
 
+// --- weekly roll-up --------------------------------------------------------------
+
+{
+  const week = extra => JSON.stringify(Object.assign({
+    version: 1, week: "2026-W41", start: "2026-10-05", end: "2026-10-11",
+    days: ["2026-10-05", "2026-10-06", "nope"], generated_at: iso(NOW - days(2)), model: "sonnet",
+    themes: [{ title: "Agents\u0000 grow up", summary: "Two threads met.", links: [{ title: "x", url: "https://x.example" }] },
+             { title: "", summary: "untitled" }, "junk"],
+    top_picks: [
+      { id: "000000000001", headline: "Known", why: "W", url: "https://example.com/1", date: "2026-10-06", section: "repos" },
+      { id: "bad", headline: "Unknown", why: "W", url: "https://new.example", date: null, section: "skipped" },
+      { id: "000000000003", headline: "Bad url", why: "W", url: "javascript:alert(1)", date: "2026-10-06", section: "top" },
+      { id: "000000000004", headline: "", why: "W", url: "https://e.example", date: "2026-10-06", section: "top" }],
+    next_week_focus: "Build\nan eval harness."
+  }, extra || {}))
+
+  const w = D.parseWeekly(week())
+  assert.strictEqual(w.week, "2026-W41", "week label")
+  assert.strictEqual(w.days, 2, "only valid day dates counted")
+  assert.deepStrictEqual(w.themes, [{ title: "Agents grow up", summary: "Two threads met." }], "themes sanitized, untitled dropped")
+  assert.deepStrictEqual(w.top_picks.map(p => p.headline), ["Known", "Unknown"], "bad-URL and untitled picks dropped")
+  assert.deepStrictEqual(w.top_picks[0], { id: "000000000001", headline: "Known", why: "W", url: "https://example.com/1",
+                                           date: "2026-10-06", section: "repos" }, "pick shape")
+  assert.deepStrictEqual([w.top_picks[1].id, w.top_picks[1].date, w.top_picks[1].section], [null, "", "top"], "unknown pick defaults")
+  assert.strictEqual(w.next_week_focus, "Build an eval harness.", "focus sanitized")
+  assert.strictEqual(D.parseWeekly(week({ week: "2026-41" })), null, "bad week label")
+  assert.strictEqual(D.parseWeekly("{ truncated"), null, "unparseable weekly")
+  assert.strictEqual(D.parseWeekly("[]"), null, "non-object weekly")
+  const bare = D.parseWeekly(JSON.stringify({ week: "2026-W53" }))
+  assert.deepStrictEqual([bare.themes, bare.top_picks, bare.next_week_focus, bare.days], [[], [], "", 0], "missing fields default")
+
+  const list = D.weekRows(w)
+  assert.deepStrictEqual(list.map(r => r.kind + ":" + r.section), [
+    "header:themes", "theme:themes", "header:picks", "item:picks", "item:picks", "header:focus", "note:focus"
+  ], "week row order")
+  assert.strictEqual(list[1].title, "Agents grow up", "theme title")
+  assert.strictEqual(list[1].text, "Two threads met.", "theme summary")
+  const pick = list[3].item
+  assert.deepStrictEqual([pick.id, pick.title, pick.url, pick.section, pick.date, pick.meta],
+                         ["000000000001", "Known", "https://example.com/1", "repos", "2026-10-06", "Repos worth a look · 2026-10-06"],
+                         "pick row carries what save and vote store")
+  assert.strictEqual(D.moveCursor(list, -1, 1), 3, "the cursor starts on the first pick, past the themes")
+  assert.strictEqual(D.voteOf(D.toggleVote(D.emptyReader(), pick, 1, iso(NOW)), pick.id), 1, "picks can be voted on")
+  assert.strictEqual(D.isSaved(D.toggleSaved(D.emptyReader(), pick, iso(NOW)), pick.id), true, "picks can be saved")
+  assert.strictEqual(D.weekRows(null)[0].kind, "empty", "no weekly yet")
+  assert.strictEqual(D.weekRows(bare)[0].text, "This week's roll-up is empty.", "empty weekly")
+
+  assert.strictEqual(D.weekMeta(w, NOW), "2026-W41 · 2026-10-05 – 2026-10-11 · 2 digests · 2d ago", "week meta")
+  assert.strictEqual(D.weekMeta(bare, NOW), "2026-W53", "bare week meta")
+  assert.strictEqual(D.weekMeta(null, NOW), "", "no weekly, no meta")
+  assert.ok(D.helpRows().some(r => r.key === "W"), "help lists W")
+}
+
 console.log("digest-test: all checks passed")

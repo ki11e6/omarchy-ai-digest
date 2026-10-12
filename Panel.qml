@@ -28,6 +28,7 @@ Panel {
   property var status: null
   property var archiveIndex: null
   property var digest: null
+  property var weekly: null
   property bool useMarkdown: false
   property string legacyText: ""
 
@@ -42,7 +43,7 @@ Panel {
   property string cursorSection: ""
   property string cursorId: ""
 
-  // digest | search | saved | tries | health | help
+  // digest | search | saved | tries | health | week | help
   property string view: "digest"
   property string searchQuery: ""
   property string notice: ""
@@ -74,6 +75,7 @@ Panel {
     if (view === "saved") return Digest.savedRows(reader)
     if (view === "tries") return Digest.triesRows(reader)
     if (view === "health") return Digest.healthRows(status, nowMs)
+    if (view === "week") return Digest.weekRows(weekly)
     if (view === "help") return Digest.helpRows()
     return Digest.rows(digest, showSkipped)
   }
@@ -83,7 +85,7 @@ Panel {
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property var viewTitles: ({ search: "Search", saved: "Saved", tries: "Try log", health: "Feed health", help: "Keys" })
+  readonly property var viewTitles: ({ search: "Search", saved: "Saved", tries: "Try log", health: "Feed health", week: "Week", help: "Keys" })
 
   readonly property string tooltip: {
     var parts = []
@@ -96,6 +98,7 @@ Panel {
   readonly property string metaText: {
     if (view === "search") return searchQuery.trim() ? searchResults.length + (searchResults.length === Digest.MAX_RESULTS ? "+" : "") + " matches" : ""
     if (view === "saved") return Digest.savedList(reader).length + " saved"
+    if (view === "week") return Digest.weekMeta(weekly, nowMs)
     if (view !== "digest") return ""
     var parts = []
     if (facts.date) parts.push(facts.date)
@@ -116,8 +119,9 @@ Panel {
   readonly property string historyText: {
     if (view !== "digest" || !archiveIndex || archiveIndex.days.length < 2) return ""
     var parts = []
-    if (neighbours.older) parts.push("[ ← " + neighbours.older)
-    if (neighbours.newer) parts.push(neighbours.newer + " → ]")
+    // key first, then what it does, like the footer hints
+    if (neighbours.older) parts.push("[ older " + neighbours.older)
+    if (neighbours.newer) parts.push("] newer " + neighbours.newer)
     if (selectedDate !== "") parts.push("T newest")
     return parts.join("   ·   ")
   }
@@ -270,7 +274,12 @@ Panel {
         if (i >= 0 && rowList[i].kind !== "item") i = Digest.moveCursor(rowList, i, -1)
       }
     }
-    setCursor(i >= 0 && rowList[i].kind === "item" ? i : Digest.moveCursor(rowList, -1, 1))
+    var first = Digest.moveCursor(rowList, -1, 1)
+    setCursor(i >= 0 && rowList[i].kind === "item" ? i : first)
+    // On the first item, show the list from its top instead: whatever sits
+    // above it (W's themes, a note) stays in view. Also covers files that
+    // finish loading after the view switched, which rebuild the rows again.
+    if (cursorIndex === first) flick.contentY = 0
   }
 
   onRowListChanged: {
@@ -284,7 +293,7 @@ Panel {
     notice = ""
     var same = next === view
     resetCursor()
-    // every view opens at the top, header included; the first row is still in view
+    // every view opens at the top of its list; the first row is still in view
     flick.contentY = 0
     view = next
     // same view: rowList doesn't change, so nothing else puts the cursor back
@@ -362,7 +371,10 @@ Panel {
   }
 
   function editDay() {
-    Util.execArgv(["omarchy-launch-editor", view === "health" ? feedsPath : dayBase + ".md"])
+    var path = dayBase + ".md"
+    if (view === "health") path = feedsPath
+    else if (view === "week" && weekly) path = digestDir + "/weekly/" + weekly.week + ".md"
+    Util.execArgv(["omarchy-launch-editor", path])
     root.close()
   }
 
@@ -375,12 +387,16 @@ Panel {
     if (shownDate) updateReader(Digest.markDone(reader, shownDate, nowIso()))
   }
 
-  readonly property var viewKeys: ({ "S": "saved", "L": "tries", "H": "health", "?": "help" })
+  readonly property var viewKeys: ({ "S": "saved", "L": "tries", "H": "health", "W": "week", "?": "help" })
 
   function handleKey(t) {
     var item = selectedItem()
     if (t === "/") setView("search")
-    else if (viewKeys[t]) setView(view === viewKeys[t] ? "digest" : viewKeys[t])
+    else if (viewKeys[t]) {
+      // the weekly run doesn't touch status.json, so nothing else tells the panel it changed
+      if (t === "W") weeklyFile.reload()
+      setView(view === viewKeys[t] ? "digest" : viewKeys[t])
+    }
     else if (t === "o") openItem(item)
     else if (t === "c") copyItem(item)
     else if (t === "a") askItem(item)
@@ -433,6 +449,7 @@ Panel {
       root.nowMs = Date.now()
       indexFile.reload()
       dayFile.reload()
+      weeklyFile.reload()
       if (root.useMarkdown) mdFile.reload()
     }
     onLoadFailed: function(error) { root.status = null }
@@ -458,6 +475,15 @@ Panel {
       root.digest = null
       root.useMarkdown = true
     }
+  }
+
+  // `ai-digest --weekly`'s newest roll-up (a symlink the service repoints).
+  FileView {
+    id: weeklyFile
+    path: root.digestDir + "/weekly/latest.json"
+    printErrors: false
+    onLoaded: root.weekly = Digest.parseWeekly(text())
+    onLoadFailed: function(error) { root.weekly = null }
   }
 
   // Legacy days have no JSON; their markdown is shown as plain text.
@@ -577,9 +603,10 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + footerGap + footer.implicitHeight, Style.space(680))
+    contentHeight: panel.fittedContentHeight(
+      header.implicitHeight + gap + column.implicitHeight + gap + footer.implicitHeight, Style.space(680))
 
-    readonly property int footerGap: Style.space(10)
+    readonly property int gap: Style.space(10)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -603,13 +630,77 @@ Panel {
         root.handleKey(t)
       }
 
+      // Outside the Flickable, like the footer: which day or view this is, and
+      // any run warning, stay visible however far the list scrolls.
+      Column {
+        id: header
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        spacing: panel.gap
+
+        PanelHero {
+          width: parent.width
+          title: root.view === "digest" ? "AI digest" : "AI digest · " + root.viewTitles[root.view]
+          meta: root.metaText
+          detail: root.detailText
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          iconComponent: Component {
+            Text {
+              textFormat: Text.PlainText
+              text: String.fromCodePoint(0xF0395)
+              color: root.urgent ? root.urgentColor : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: text !== ""
+          width: parent.width
+          text: [root.urgentText, root.readerWarning].filter(function(s) { return s !== "" }).join("\n")
+          color: root.urgentColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: text !== ""
+          width: parent.width
+          text: root.dimText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        TextField {
+          id: searchField
+          visible: root.view === "search"
+          width: parent.width
+          placeholderText: "Search " + (root.archiveIndex ? root.archiveIndex.days.length : 0) + " days of digests"
+          foreground: root.foreground
+          font.family: root.fontFamily
+          onTextChanged: root.searchQuery = text
+          Keys.onEscapePressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
+          Keys.onReturnPressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
+          Keys.onEnterPressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
+        }
+      }
+
       Flickable {
         id: flick
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.top: parent.top
+        anchors.top: header.bottom
+        anchors.topMargin: panel.gap
         anchors.bottom: footer.top
-        anchors.bottomMargin: panel.footerGap
+        anchors.bottomMargin: panel.gap
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
@@ -621,60 +712,7 @@ Panel {
         Column {
           id: column
           width: flick.width
-          spacing: Style.space(10)
-
-          PanelHero {
-            width: parent.width
-            title: root.view === "digest" ? "AI digest" : "AI digest · " + root.viewTitles[root.view]
-            meta: root.metaText
-            detail: root.detailText
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            iconComponent: Component {
-              Text {
-                textFormat: Text.PlainText
-                text: String.fromCodePoint(0xF0395)
-                color: root.urgent ? root.urgentColor : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.display
-              }
-            }
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: text !== ""
-            width: parent.width
-            text: [root.urgentText, root.readerWarning].filter(function(s) { return s !== "" }).join("\n")
-            color: root.urgentColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: text !== ""
-            width: parent.width
-            text: root.dimText
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
-
-          TextField {
-            id: searchField
-            visible: root.view === "search"
-            width: parent.width
-            placeholderText: "Search " + (root.archiveIndex ? root.archiveIndex.days.length : 0) + " days of digests"
-            foreground: root.foreground
-            font.family: root.fontFamily
-            onTextChanged: root.searchQuery = text
-            Keys.onEscapePressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
-            Keys.onReturnPressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
-            Keys.onEnterPressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
-          }
+          spacing: panel.gap
 
           Column {
             id: listColumn
@@ -713,6 +751,39 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   wrapMode: Text.WordWrap
+                }
+
+                // a weekly theme: prose, not a selectable item
+                Column {
+                  visible: slot.modelData.kind === "theme"
+                  width: parent.width
+                  leftPadding: Style.spacing.rowPaddingX
+                  rightPadding: Style.space(8)
+                  topPadding: Style.space(4)
+                  bottomPadding: Style.space(4)
+                  spacing: Style.space(2)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    width: parent.width - parent.leftPadding - parent.rightPadding
+                    text: slot.modelData.kind === "theme" ? slot.modelData.title : ""
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: text !== ""
+                    width: parent.width - parent.leftPadding - parent.rightPadding
+                    text: slot.modelData.kind === "theme" ? slot.modelData.text : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
                 }
 
                 Row {
@@ -795,7 +866,7 @@ Panel {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        spacing: panel.footerGap
+        spacing: panel.gap
 
         PanelSeparator {
           width: parent.width

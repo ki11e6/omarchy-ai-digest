@@ -39,6 +39,7 @@ var DAY_STATES = ["ok", "empty", "degraded"]
 
 var URL_RE = /^https?:\/\/\S+$/
 var DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+var WEEK_RE = /^\d{4}-W\d{2}$/
 var ID_RE = /^[0-9a-f]{12}$/
 
 function isObject(v) {
@@ -154,6 +155,47 @@ function parseDigest(raw) {
     repos: repos,
     "try": tryItem,
     skipped: cleanText(d.skipped, MAX_SKIPPED)
+  }
+}
+
+// weekly/latest.json, from `ai-digest --weekly`. Theme links aren't read: the
+// view shows a theme as prose, and its items through the week's .md (`e`).
+function parseWeekly(raw) {
+  var w = parseJson(raw)
+  if (!isObject(w) || typeof w.week !== "string" || !WEEK_RE.test(w.week)) return null
+
+  var themes = []
+  var rawThemes = Array.isArray(w.themes) ? w.themes : []
+  for (var i = 0; i < rawThemes.length && themes.length < MAX_ITEMS; i++) {
+    var t = rawThemes[i]
+    if (!isObject(t)) continue
+    var title = cleanText(t.title, MAX_TITLE)
+    if (title) themes.push({ title: title, summary: cleanText(t.summary, MAX_WHAT) })
+  }
+
+  var picks = []
+  var rawPicks = Array.isArray(w.top_picks) ? w.top_picks : []
+  for (var j = 0; j < rawPicks.length && picks.length < MAX_ITEMS; j++) {
+    var p = rawPicks[j]
+    if (!isObject(p)) continue
+    var url = cleanUrl(p.url)
+    var headline = cleanText(p.headline, MAX_TITLE)
+    if (!url || !headline) continue
+    // the day and section the pick first appeared in, so saves and votes read like the daily ones
+    picks.push({ id: cleanId(p.id), headline: headline, why: cleanText(p.why, MAX_WHY), url: url,
+                 date: cleanDate(p.date) || "",
+                 section: ["top", "repos", "try"].indexOf(p.section) >= 0 ? p.section : "top" })
+  }
+
+  return {
+    week: w.week,
+    start: cleanDate(w.start) || "",
+    end: cleanDate(w.end) || "",
+    days: Array.isArray(w.days) ? w.days.filter(function(d) { return cleanDate(d) !== null }).length : 0,
+    generated_at: typeof w.generated_at === "string" ? w.generated_at : "",
+    themes: themes,
+    top_picks: picks,
+    next_week_focus: cleanText(w.next_week_focus, MAX_WHAT)
   }
 }
 
@@ -701,6 +743,43 @@ function healthRows(status, nowMs) {
   return out
 }
 
+// `W`: themes as prose, top picks as item rows (open, copy, ask, save, vote),
+// then the focus line.
+function weekRows(weekly) {
+  if (!weekly) return [{ kind: "empty", section: "", text: "No weekly roll-up yet. It runs on Sunday mornings, or now with: ai-digest --weekly" }]
+  var out = []
+  if (weekly.themes.length) {
+    out.push({ kind: "header", section: "themes", text: "Themes" })
+    for (var i = 0; i < weekly.themes.length; i++) {
+      var t = weekly.themes[i]
+      out.push({ kind: "theme", section: "themes", title: t.title, text: t.summary })
+    }
+  }
+  if (weekly.top_picks.length) {
+    out.push({ kind: "header", section: "picks", text: "Top picks" })
+    for (var j = 0; j < weekly.top_picks.length; j++) {
+      var p = weekly.top_picks[j]
+      out.push({ kind: "item", section: "picks",
+                 item: rowItem(p.section, p.id, p.headline, p.why, p.url, { date: p.date, meta: itemMeta(p.section, p.date) }) })
+    }
+  }
+  if (weekly.next_week_focus) {
+    out.push({ kind: "header", section: "focus", text: "Focus for next week" })
+    out.push({ kind: "note", section: "focus", text: weekly.next_week_focus })
+  }
+  return out.length ? out : [{ kind: "empty", section: "", text: "This week's roll-up is empty." }]
+}
+
+function weekMeta(weekly, nowMs) {
+  if (!weekly) return ""
+  var parts = [weekly.week]
+  if (weekly.start && weekly.end) parts.push(weekly.start + " – " + weekly.end)
+  if (weekly.days) parts.push(weekly.days + (weekly.days === 1 ? " digest" : " digests"))
+  var generated = Date.parse(weekly.generated_at)
+  if (isFinite(generated)) parts.push(freshness(generated, nowMs))
+  return parts.join(" · ")
+}
+
 function duration(ms) {
   var s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s"
@@ -726,7 +805,8 @@ var KEYS = [
   ["+ / -", "vote up / down (again to clear); steers the next digests"],
   ["[ / ]", "older / newer day"], ["T", "back to the newest day"], ["/", "search the archive (g: go to that day)"],
   ["S", "saved items"], ["E", "export saved items to saved.md"], ["L", "try log"], ["H", "feed health"],
-  ["e", "edit the day's .md (in H: feeds.txt)"], ["r", "run the digest now"], ["m", "mark the day done"],
+  ["W", "weekly roll-up"],
+  ["e", "edit the day's .md (in H: feeds.txt, in W: the week's .md)"], ["r", "run the digest now"], ["m", "mark the day done"],
   ["?", "this help"], ["Esc", "back, then close"]
 ]
 
@@ -792,6 +872,7 @@ if (typeof module !== "undefined") {
     parseDigest: parseDigest,
     parseStatus: parseStatus,
     parseIndex: parseIndex,
+    parseWeekly: parseWeekly,
     emptyReader: emptyReader,
     parseReader: parseReader,
     serializeReader: serializeReader,
@@ -824,6 +905,8 @@ if (typeof module !== "undefined") {
     triesRows: triesRows,
     healthRows: healthRows,
     healthSummary: healthSummary,
+    weekRows: weekRows,
+    weekMeta: weekMeta,
     helpRows: helpRows,
     savedMarkdown: savedMarkdown,
     agentPrompt: agentPrompt,

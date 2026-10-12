@@ -40,7 +40,8 @@ quiet for longer than usual) don't change the icon; they're listed in the panel.
 | `[` / `]`, `T` | older / newer day; back to the newest |
 | `/` | search every digest in the archive; `g` on a result goes to that day |
 | `H` | feed health: each feed's last fetch, newest item, stale marker, error |
-| `e` | open the day's markdown in your editor (in `H`: `feeds.txt`) |
+| `W` | the weekly roll-up: themes, top picks (open, copy, ask, save, vote), a focus for next week |
+| `e` | open the day's markdown in your editor (in `H`: `feeds.txt`; in `W`: the week's markdown) |
 | `r` | run the digest now |
 | `m` | mark the day's digest done (clears the dot) |
 | `?` | key help |
@@ -61,6 +62,7 @@ o.bind("SUPER + ALT + D", "AI digest", "omarchy-shell shell toggle io.github.ki1
 | `~/ai-digest/index.json` | service | which day is newest, history, search |
 | `~/ai-digest/YYYY-MM-DD.json` | service | the day shown |
 | `~/ai-digest/YYYY-MM-DD.md` | service | `e`, and days without JSON (shown as plain text) |
+| `~/ai-digest/weekly/latest.json` | service (`ai-digest --weekly`, Sundays) | `W`; reread on every `W` |
 | `~/.local/state/ai-digest/reader.json` | this plugin | read items, done days, saved items, try-states, votes |
 | `~/ai-digest/saved.md` | this plugin, on `E` | the saved list as markdown links |
 
