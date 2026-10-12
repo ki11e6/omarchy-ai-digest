@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ki11e6.ai-digest",
+  "name": "AI Digest",
+  "version": "0.1.0",
+  "author": "ki11e6",
+  "license": "MIT",
+  "description": "Reads the daily ai-digest in the bar: today's stories, repos and one thing to try.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "AI Digest",
+    "description": "Daily AI digest. Enter opens, a asks your agent, r runs the digest now.",
+    "category": "News",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
