@@ -7,7 +7,8 @@ import qs.Ui
 import "Digest.js" as Digest
 
 // Bar icon + keyboard panel for the ai-digest service. Read-only over the
-// service's files; the only thing written is reader.json.
+// service's files; the only things written are reader.json and, on `E`,
+// saved.md.
 //
 // The bar builds this widget once per monitor, so everything here exists N
 // times. No IpcHandler: `omarchy-shell shell toggle <id>` already routes to
@@ -18,8 +19,11 @@ Panel {
   moduleName: "io.github.ki11e6.ai-digest"
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string digestDir: home + "/ai-digest"
+  readonly property string digestDir: expandPath(setting("digestDir", "")) || home + "/ai-digest"
   readonly property string stateDir: home + "/.local/state/ai-digest"
+  readonly property string feedsPath: home + "/.config/ai-digest/feeds.txt"
+  readonly property bool showSkipped: setting("showSkipped", true) === true
+  readonly property bool unreadDot: setting("unreadDot", true) === true
 
   property var status: null
   property var archiveIndex: null
@@ -38,28 +42,48 @@ Panel {
   property string cursorSection: ""
   property string cursorId: ""
 
+  // digest | search | saved | tries | health | help
+  property string view: "digest"
+  property string searchQuery: ""
+  property string notice: ""
+  property int exportCount: 0
+  // `g` from search: where the cursor goes once that day has loaded
+  property var pendingJump: null
+
   // Never derived from the clock: the newest day is whatever the service last
   // wrote. Without index.json, latest.json stands in; status.date isn't used
   // because a failed run's date has no day file.
   readonly property string newestDate: archiveIndex && archiveIndex.days.length > 0
     ? archiveIndex.days[0].date
     : ""
-  // Phase 4 makes this navigable; for now it follows the newest day.
-  readonly property string selectedDate: newestDate
-  readonly property string dayBase: digestDir + "/" + (selectedDate !== "" ? selectedDate : "latest")
-  readonly property string shownDate: digest ? digest.date : selectedDate
+  // "" follows the newest day, so a new digest shows up without pressing T
+  property string selectedDate: ""
+  readonly property string shownDay: selectedDate !== "" ? selectedDate : newestDate
+  readonly property string dayBase: digestDir + "/" + (shownDay !== "" ? shownDay : "latest")
+  readonly property string shownDate: digest ? digest.date : shownDay
   readonly property string unreadDate: newestDate !== "" ? newestDate : (digest ? digest.date : "")
+  readonly property var neighbours: Digest.dayNeighbours(archiveIndex, shownDay)
 
   readonly property string barState: Digest.barState(status, unreadDate, reader, nowMs)
   readonly property bool unread: Digest.isUnread(unreadDate, reader)
   readonly property bool urgent: Digest.isUrgent(barState)
   readonly property var facts: Digest.headerFacts(digest, status)
-  readonly property var rowList: Digest.rows(digest, true)
+  readonly property var searchResults: view === "search" ? Digest.search(archiveIndex, searchQuery) : []
+  readonly property var rowList: {
+    if (view === "search") return Digest.searchRows(searchResults, searchQuery)
+    if (view === "saved") return Digest.savedRows(reader)
+    if (view === "tries") return Digest.triesRows(reader)
+    if (view === "health") return Digest.healthRows(status, nowMs)
+    if (view === "help") return Digest.helpRows()
+    return Digest.rows(digest, showSkipped)
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  readonly property var viewTitles: ({ search: "Search", saved: "Saved", tries: "Try log", health: "Feed health", help: "Keys" })
 
   readonly property string tooltip: {
     var parts = []
@@ -70,18 +94,32 @@ Panel {
   }
 
   readonly property string metaText: {
+    if (view === "search") return searchQuery.trim() ? searchResults.length + (searchResults.length === Digest.MAX_RESULTS ? "+" : "") + " matches" : ""
+    if (view === "saved") return Digest.savedList(reader).length + " saved"
+    if (view !== "digest") return ""
     var parts = []
     if (facts.date) parts.push(facts.date)
-    if (facts.generatedMs !== null) parts.push(Digest.freshness(facts.generatedMs, nowMs))
+    if (digest && digest.legacy) parts.push("from the old archive")
+    else if (facts.generatedMs !== null) parts.push(Digest.freshness(facts.generatedMs, nowMs))
     if (barState === "running") parts.push("running now")
     return parts.join(" · ")
   }
 
   readonly property string detailText: {
+    if (view !== "digest") return ""
     var parts = []
     if (facts.sources) parts.push(facts.sources + " sources")
     if (facts.catchUp) parts.push(facts.catchUp)
     return parts.join(" · ")
+  }
+
+  readonly property string historyText: {
+    if (view !== "digest" || !archiveIndex || archiveIndex.days.length < 2) return ""
+    var parts = []
+    if (neighbours.older) parts.push("[ ← " + neighbours.older)
+    if (neighbours.newer) parts.push(neighbours.newer + " → ]")
+    if (selectedDate !== "") parts.push("T newest")
+    return parts.join("   ·   ")
   }
 
   readonly property string urgentText: {
@@ -99,8 +137,12 @@ Panel {
 
   readonly property string dimText: {
     var lines = []
-    if (!urgent && facts.failed.length) lines.push("failed: " + facts.failed.join(", "))
-    if (facts.stale.length) lines.push("stale: " + facts.stale.join(", "))
+    if (historyText) lines.push(historyText)
+    // too long for the hero's single meta line
+    if (view === "health") lines.push(Digest.healthSummary(status, nowMs))
+    if (view === "digest" && !urgent && facts.failed.length) lines.push("failed: " + facts.failed.join(", "))
+    if (view === "digest" && facts.stale.length) lines.push("stale: " + facts.stale.join(", "))
+    if (notice) lines.push(notice)
     return lines.join("\n")
   }
 
@@ -110,6 +152,21 @@ Panel {
 
   function nowIso() {
     return new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+  }
+
+  // Same rules as the first-party agents plugin's sync folder setting.
+  function expandPath(path) {
+    var value = String(path || "").trim()
+    if (value === "") return ""
+    if (value === "~") return home
+    if (value.indexOf("~/") === 0) return home + value.substring(1)
+    if (value.indexOf("$HOME/") === 0) return home + value.substring(5)
+    if (value.charAt(0) !== "/") return home + "/" + value
+    return value.replace(/\/+$/, "")
+  }
+
+  function shortPath(path) {
+    return path.indexOf(home + "/") === 0 ? "~" + path.substring(home.length) : path
   }
 
   // --- reader state ---------------------------------------------------------
@@ -125,7 +182,7 @@ Panel {
     if (parsed === null) {
       readerWarning = "reader.json is unreadable; starting with empty reader state."
     } else {
-      reader = Digest.mergeReader(reader, parsed)
+      reader = Digest.mergeReader(reader, parsed, nowIso())
       readerWarning = ""
     }
     readerReady = true
@@ -148,13 +205,15 @@ Panel {
   function setCursor(i) {
     cursorIndex = i
     var item = selectedItem()
-    cursorSection = item ? item.section : ""
+    cursorSection = item ? rowList[i].section : ""
     cursorId = item && item.id ? item.id : ""
     ensureRowVisible(i)
   }
 
   function ensureRowVisible(i) {
-    if (!flick || !listColumn || i < 0) return
+    // before the first layout the viewport has no height yet, and every row
+    // would look "below" it
+    if (!flick || !listColumn || i < 0 || flick.height <= 0) return
     var kids = listColumn.children
     for (var n = 0; n < kids.length; n++) {
       var k = kids[n]
@@ -167,16 +226,96 @@ Panel {
     }
   }
 
+  // The panel is a full-screen surface, so rows sliding under a still pointer
+  // (first layout, scrolling) produce hover events; only real pointer motion
+  // moves the cursor. Same gate as the shell's clipboard plugin.
+  function selectFromPointer(i, area, mouse) {
+    if (pointerGate.moved(area, mouse)) setCursor(i)
+  }
+
   function jumpToSection(section) {
     var t = Digest.sectionTarget(rowList, section)
     if (t < 0) return
-    if (rowList[t].kind === "item") setCursor(t)
-    else ensureRowVisible(t)
+    if (rowList[t].kind === "item") {
+      setCursor(t)
+      return
+    }
+    // no item to select (Skipped): show the section to its last row, since
+    // the cursor can't go there; its header wins if both don't fit
+    var last = t
+    while (last + 1 < rowList.length && rowList[last + 1].section === section) last++
+    ensureRowVisible(last)
+    ensureRowVisible(t)
+  }
+
+  function resetCursor() {
+    cursorIndex = -1
+    cursorSection = ""
+    cursorId = ""
+  }
+
+  // Same item if it's still there; otherwise the nearest item at or above the
+  // old position (an unsave in the saved view), else the first item.
+  function placeCursor() {
+    var i = -1
+    var jump = pendingJump
+    if (jump && view === "digest" && digest && digest.date === jump.date) {
+      pendingJump = null
+      i = Digest.findRow(rowList, jump.section, jump.id)
+      if (i < 0) i = Digest.sectionTarget(rowList, jump.section)
+    } else {
+      i = Digest.findRow(rowList, cursorSection, cursorId)
+      if (i < 0 && cursorIndex >= 0) {
+        i = Math.min(cursorIndex, rowList.length - 1)
+        if (i >= 0 && rowList[i].kind !== "item") i = Digest.moveCursor(rowList, i, -1)
+      }
+    }
+    setCursor(i >= 0 && rowList[i].kind === "item" ? i : Digest.moveCursor(rowList, -1, 1))
   }
 
   onRowListChanged: {
-    var i = Digest.findRow(rowList, cursorSection, cursorId)
-    setCursor(i >= 0 ? i : Digest.moveCursor(rowList, -1, 1))
+    pointerGate.reset()
+    placeCursor()
+  }
+
+  // --- views and history ------------------------------------------------------
+
+  function setView(next) {
+    notice = ""
+    var same = next === view
+    resetCursor()
+    // every view opens at the top, header included; the first row is still in view
+    flick.contentY = 0
+    view = next
+    // same view: rowList doesn't change, so nothing else puts the cursor back
+    if (same) placeCursor()
+    if (next === "search") {
+      Qt.callLater(function() { searchField.forceActiveFocus(); searchField.selectAll() })
+    } else {
+      keyCatcher.forceActiveFocus()
+    }
+  }
+
+  function showDay(date) {
+    if (!date) return
+    pendingJump = null
+    var next = date === newestDate ? "" : date
+    var same = next === selectedDate && view === "digest"
+    resetCursor()
+    selectedDate = next
+    if (view !== "digest") setView("digest")
+    if (same) placeCursor()
+    flick.contentY = 0
+  }
+
+  function jumpTo(item) {
+    if (!item) return
+    var target = Digest.jumpTarget(archiveIndex, item.id, item.date, item.section)
+    if (!target) return
+    showDay(target.date)
+    pendingJump = target
+    // the day may already be loaded, in which case no reload will apply the jump
+    if (digest && digest.date === target.date) placeCursor()
   }
 
   // --- actions --------------------------------------------------------------
@@ -194,13 +333,30 @@ Panel {
   }
 
   function askItem(item) {
-    if (!item) return
+    if (!item || view === "health") return
     Util.execArgv(["omarchy", "agent", "prompt", Digest.agentPrompt(item)])
     root.close()
   }
 
+  function saveItem(item) {
+    if (!item || view === "health") return
+    if (!item.id) { notice = "This item has no link, so it can't be saved."; return }
+    updateReader(Digest.toggleSaved(reader, item, nowIso()))
+  }
+
+  function cycleTryItem(item) {
+    if (!item || view === "health") return
+    if (!item.id) { notice = "This item has no link, so it can't be tracked."; return }
+    updateReader(Digest.cycleTry(reader, item, nowIso()))
+  }
+
+  function exportSaved() {
+    exportCount = Digest.savedList(reader).length
+    exportFile.setText(Digest.savedMarkdown(reader))
+  }
+
   function editDay() {
-    Util.execArgv(["omarchy-launch-editor", dayBase + ".md"])
+    Util.execArgv(["omarchy-launch-editor", view === "health" ? feedsPath : dayBase + ".md"])
     root.close()
   }
 
@@ -213,13 +369,45 @@ Panel {
     if (shownDate) updateReader(Digest.markDone(reader, shownDate, nowIso()))
   }
 
+  readonly property var viewKeys: ({ "S": "saved", "L": "tries", "H": "health", "?": "help" })
+
+  function handleKey(t) {
+    var item = selectedItem()
+    if (t === "/") setView("search")
+    else if (viewKeys[t]) setView(view === viewKeys[t] ? "digest" : viewKeys[t])
+    else if (t === "o") openItem(item)
+    else if (t === "c") copyItem(item)
+    else if (t === "a") askItem(item)
+    else if (t === "s") saveItem(item)
+    else if (t === "t") cycleTryItem(item)
+    else if (t === "E") exportSaved()
+    else if (t === "e") editDay()
+    else if (t === "r") runNow()
+    else if (t === "[") showDay(neighbours.older)
+    else if (t === "]") showDay(neighbours.newer)
+    else if (t === "T") showDay(newestDate)
+    else if (t === "g" && view === "search") jumpTo(item)
+    else if (view === "digest") {
+      var n = "1234".indexOf(t)
+      if (n >= 0) jumpToSection(Digest.SECTIONS[n])
+      else if (t === "m") markDayDone()
+    }
+  }
+
   onOpenedChanged: {
     if (!opened) return
     nowMs = Date.now()
-    // the header carries the run state, so every open starts at the top
-    flick.contentY = 0
+    notice = ""
+    // every open starts on the newest digest, at the top: the header carries the run state
+    pointerGate.reset()
+    if (selectedDate !== "") showDay(newestDate)
+    if (view !== "digest") setView("digest")
     if (cursorIndex < 0) setCursor(Digest.moveCursor(rowList, -1, 1))
-    else ensureRowVisible(cursorIndex)
+    // after the first layout: on the first open the panel has no size yet
+    Qt.callLater(function() {
+      flick.contentY = 0
+      root.ensureRowVisible(root.cursorIndex)
+    })
   }
 
   // --- files ----------------------------------------------------------------
@@ -297,6 +485,22 @@ Panel {
     }
   }
 
+  // Write-only: never loaded, so a hand-edited saved.md is only replaced on `E`.
+  FileView {
+    id: exportFile
+    path: root.digestDir + "/saved.md"
+    preload: false
+    atomicWrites: true
+    printErrors: false
+    onSaved: root.notice = "Exported " + root.exportCount + " items to " + root.shortPath(path)
+    onSaveFailed: function(error) { root.notice = "Can't write saved.md: " + FileViewError.toString(error) }
+  }
+
+  PointerMoveGate {
+    id: pointerGate
+    referenceItem: flick
+  }
+
   Timer {
     id: saveTimer
     interval: 400
@@ -344,7 +548,7 @@ Panel {
     }
 
     Rectangle {
-      visible: root.unread
+      visible: root.unread && root.unreadDot
       width: Style.space(5)
       height: width
       radius: width / 2
@@ -365,34 +569,39 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(680))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + footerGap + footer.implicitHeight, Style.space(680))
+
+    readonly property int footerGap: Style.space(10)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // the search field takes every key while focused; it hands Esc and
+      // Enter back itself (see searchField)
+      blocked: searchField.activeFocus
       onMoveRequested: function(dx, dy) {
+        pointerGate.reset()
         if (dy !== 0) root.setCursor(Digest.moveCursor(root.rowList, root.cursorIndex, dy))
       }
       onTabRequested: function(direction) {
-        root.setCursor(Digest.nextSection(root.rowList, root.cursorIndex, direction))
+        pointerGate.reset()
+        if (root.view === "digest") root.setCursor(Digest.nextSection(root.rowList, root.cursorIndex, direction))
       }
       // Enter fires both returnRequested and activateRequested; only this one is used.
       onActivateRequested: root.openItem(root.selectedItem())
-      onCloseRequested: root.close()
+      onCloseRequested: root.view !== "digest" ? root.setView("digest") : root.close()
       onTextKey: function(t) {
-        var n = "1234".indexOf(t)
-        if (n >= 0) root.jumpToSection(Digest.SECTIONS[n])
-        else if (t === "o") root.openItem(root.selectedItem())
-        else if (t === "c") root.copyItem(root.selectedItem())
-        else if (t === "a") root.askItem(root.selectedItem())
-        else if (t === "e") root.editDay()
-        else if (t === "r") root.runNow()
-        else if (t === "m") root.markDayDone()
+        pointerGate.reset()
+        root.handleKey(t)
       }
 
       Flickable {
         id: flick
-        anchors.fill: parent
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: footer.top
+        anchors.bottomMargin: panel.footerGap
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
@@ -408,7 +617,7 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: "AI digest"
+            title: root.view === "digest" ? "AI digest" : "AI digest · " + root.viewTitles[root.view]
             meta: root.metaText
             detail: root.detailText
             foreground: root.foreground
@@ -444,6 +653,19 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+          }
+
+          TextField {
+            id: searchField
+            visible: root.view === "search"
+            width: parent.width
+            placeholderText: "Search " + (root.archiveIndex ? root.archiveIndex.days.length : 0) + " days of digests"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            onTextChanged: root.searchQuery = text
+            Keys.onEscapePressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
+            Keys.onReturnPressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
+            Keys.onEnterPressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
           }
 
           Column {
@@ -485,6 +707,32 @@ Panel {
                   wrapMode: Text.WordWrap
                 }
 
+                Row {
+                  visible: slot.modelData.kind === "key"
+                  leftPadding: Style.spacing.rowPaddingX
+                  spacing: Style.space(12)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    width: Style.space(80)
+                    text: slot.modelData.kind === "key" ? slot.modelData.key : ""
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    width: listColumn.width - Style.space(80) - Style.space(12) - Style.spacing.rowPaddingX
+                    text: slot.modelData.kind === "key" ? slot.modelData.text : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
+                }
+
                 ItemRow {
                   visible: slot.modelData.kind === "item"
                   width: parent.width
@@ -492,9 +740,12 @@ Panel {
                   rowIndex: slot.index
                   selected: root.cursorIndex === slot.index
                   read: visible && Digest.isRead(root.reader, slot.modelData.item.id)
+                  saved: visible && Digest.isSaved(root.reader, slot.modelData.item.id)
+                  tryState: visible ? Digest.tryState(root.reader, slot.modelData.item.id) : ""
                   foreground: root.foreground
+                  urgentColor: root.urgentColor
                   fontFamily: root.fontFamily
-                  onHovered: root.setCursor(slot.index)
+                  onPointerMoved: function(area, mouse) { root.selectFromPointer(slot.index, area, mouse) }
                   onActivated: root.openItem(slot.modelData.item)
                 }
               }
@@ -503,7 +754,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            visible: root.rowList.length === 0 && root.useMarkdown && root.legacyText !== ""
+            visible: root.view === "digest" && root.rowList.length === 0 && root.useMarkdown && root.legacyText !== ""
             width: parent.width
             text: root.legacyText
             color: root.foreground
@@ -514,7 +765,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            visible: root.rowList.length === 0 && !(root.useMarkdown && root.legacyText !== "")
+            visible: root.view === "digest" && root.rowList.length === 0 && !(root.useMarkdown && root.legacyText !== "")
             width: parent.width
             topPadding: Style.space(6)
             bottomPadding: Style.space(6)
@@ -525,25 +776,35 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
           }
+        }
+      }
 
-          PanelSeparator {
-            width: parent.width
-            foreground: root.foreground
-          }
+      // Outside the Flickable so the hints stay visible on a long list; the
+      // rest of the keys are under `?`.
+      Column {
+        id: footer
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        spacing: panel.footerGap
 
-          Text {
-            textFormat: Text.PlainText
-            width: parent.width
-            // non-breaking space inside each pair, so a wrap never strands a key from its label
-            text: [["j/k", "move"], ["Tab/1-4", "section"], ["Enter/o", "open"], ["c", "copy"], ["a", "ask"],
-                   ["e", "edit"], ["r", "run"], ["m", "done"], ["Esc", "close"]]
-              .map(function(p) { return p[0] + "\u00a0" + p[1] }).join("   ")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.WordWrap
-          }
+        PanelSeparator {
+          width: parent.width
+          foreground: root.foreground
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          // non-breaking space inside each pair, so a wrap never strands a key from its label
+          text: [["Enter", "open"], ["s", "save"], ["t", "try"], ["[ ]", "day"], ["/", "search"], ["?", "keys"],
+                 ["Esc", root.view === "digest" ? "close" : "back"]]
+            .map(function(p) { return p[0] + "\u00a0" + p[1] }).join("   ")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.WordWrap
         }
       }
     }

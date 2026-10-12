@@ -334,4 +334,149 @@ assert.strictEqual(D.freshness(NOW + minutes(5), NOW), "just now", "clock skew c
   assert.strictEqual(D.headerFacts(oldDay, status).error, "", "no error when not failed")
 }
 
+// --- saved, tries, tombstones -----------------------------------------------
+
+{
+  const r0 = D.emptyReader()
+  const item = D.rows(parse(day()), true)[1].item
+  assert.strictEqual(item.date, "2026-10-12", "digest rows carry their date")
+
+  const saved = D.toggleSaved(r0, item, iso(NOW))
+  assert.strictEqual(D.isSaved(saved, item.id), true, "s saves")
+  assert.deepStrictEqual(saved.saved[item.id], { title: "Story 1", url: "https://example.com/1", date: "2026-10-12",
+                                                 section: "top", at: iso(NOW) }, "saved entry shape")
+  assert.deepStrictEqual(r0.saved, {}, "toggleSaved doesn't mutate")
+  const unsaved = D.toggleSaved(saved, item, iso(NOW + 1000))
+  assert.strictEqual(D.isSaved(unsaved, item.id), false, "s again unsaves")
+  assert.deepStrictEqual(unsaved.saved[item.id], { removed: true, at: iso(NOW + 1000) }, "unsave leaves a tombstone")
+  assert.strictEqual(D.toggleSaved(r0, Object.assign({}, item, { id: null }), iso(NOW)), r0, "no id, nothing saved")
+
+  // the removal survives a merge with another monitor's older copy, both ways round
+  assert.strictEqual(D.isSaved(D.mergeReader(unsaved, saved), item.id), false, "tombstone beats older save (mine)")
+  assert.strictEqual(D.isSaved(D.mergeReader(saved, unsaved), item.id), false, "tombstone beats older save (theirs)")
+  const resaved = D.toggleSaved(unsaved, item, iso(NOW + 2000))
+  assert.strictEqual(D.isSaved(D.mergeReader(unsaved, resaved), item.id), true, "a newer save beats the tombstone")
+  assert.deepStrictEqual(D.savedList(unsaved), [], "tombstones aren't listed")
+
+  // cycleTry: later → tried → skipped → none
+  const seq = []
+  let r = r0
+  for (let i = 0; i < 5; i++) {
+    r = D.cycleTry(r, item, iso(NOW + i * 1000))
+    seq.push(D.tryState(r, item.id))
+  }
+  assert.deepStrictEqual(seq, ["later", "tried", "skipped", "", "later"], "try cycle")
+  assert.strictEqual(r.tries[item.id].section, "top", "try entry keeps its section")
+  const none = D.cycleTry(D.cycleTry(D.cycleTry(D.cycleTry(r0, item, iso(NOW)), item, iso(NOW)), item, iso(NOW)), item, iso(NOW + 5000))
+  assert.strictEqual(none.tries[item.id].removed, true, "back to none is a tombstone")
+  const later = D.cycleTry(r0, item, iso(NOW))
+  assert.strictEqual(D.tryState(D.mergeReader(later, none), item.id), "", "try removal survives a merge")
+  assert.strictEqual(D.tryState(r0, item.id), "", "cycleTry doesn't mutate")
+
+  // tombstones and read stamps age out with the 120-day rule, also through a merge
+  const oldTomb = Object.assign(D.emptyReader(), {
+    saved: { aaaaaaaaaaaa: { removed: true, at: iso(NOW - days(121)) },
+             bbbbbbbbbbbb: { title: "Kept forever", url: "https://k.example", at: iso(NOW - days(400)) } },
+    read: { cccccccccccc: iso(NOW - days(121)) }
+  })
+  const fresh = D.toggleSaved(oldTomb, item, iso(NOW))
+  assert.deepStrictEqual(Object.keys(fresh.saved).sort(), ["000000000001", "bbbbbbbbbbbb"], "old tombstone pruned, old save kept")
+  const merged = D.mergeReader(D.emptyReader(), oldTomb, iso(NOW))
+  assert.deepStrictEqual(Object.keys(merged.saved), ["bbbbbbbbbbbb"], "merge prunes old tombstones")
+  assert.deepStrictEqual(merged.read, {}, "merge prunes old reads, so pruning isn't undone by another monitor")
+  assert.strictEqual(Object.keys(D.mergeReader(D.emptyReader(), oldTomb).read).length, 1, "no pruning without nowIso")
+
+  // views
+  const two = D.toggleSaved(D.toggleSaved(r0, item, iso(NOW)), Object.assign({}, item, { id: "000000000002", title: "Second" }), iso(NOW + 1000))
+  assert.deepStrictEqual(D.savedRows(two).map(x => x.item.title), ["Second", "Story 1"], "saved view newest first")
+  assert.strictEqual(D.savedRows(two)[1].item.meta, "Top stories · 2026-10-12", "saved row meta")
+  assert.strictEqual(D.savedRows(r0)[0].kind, "empty", "empty saved view")
+  const tracked = D.cycleTry(D.cycleTry(D.cycleTry(r0, item, iso(NOW)), item, iso(NOW)),
+                             Object.assign({}, item, { id: "000000000002", title: "Second" }), iso(NOW))
+  assert.deepStrictEqual(D.triesRows(tracked).map(x => x.kind + ":" + x.section), ["header:later", "item:later", "header:tried", "item:tried"], "try log grouped")
+  assert.strictEqual(D.triesRows(r0)[0].kind, "empty", "empty try log")
+  const junk = Object.assign(D.emptyReader(), { saved: { "not-an-id": { title: "x", at: iso(NOW) },
+                                                         dddddddddddd: { title: "", at: iso(NOW) },
+                                                         eeeeeeeeeeee: { title: "Bad url", url: "javascript:x", section: "evil", at: iso(NOW) } } })
+  assert.deepStrictEqual(D.savedList(junk).map(e => [e.id, e.url, e.section]), [["eeeeeeeeeeee", null, "top"]], "saved entries sanitized")
+}
+
+{
+  const reader = Object.assign(D.emptyReader(), { saved: {
+    "000000000001": { title: "A [tricky] title \\ here", url: "https://e.com/a_(b)", date: "2026-10-12", section: "repos", at: iso(NOW) },
+    "000000000002": { title: "No link", url: null, date: "2026-08-16", section: "try", at: iso(NOW - 1000) }
+  } })
+  assert.strictEqual(D.savedMarkdown(reader), "# Saved from AI digest\n\n" +
+    "- [A \\[tricky\\] title \\\\ here](https://e.com/a_%28b%29) — Repos worth a look, 2026-10-12\n" +
+    "- No link — Worth trying this week, 2026-08-16\n", "saved markdown escaping")
+  assert.ok(D.savedMarkdown(D.emptyReader()).indexOf("Nothing saved.") > 0, "empty export")
+}
+
+// --- history and search -------------------------------------------------------
+
+{
+  const idx = D.parseIndex(JSON.stringify({ version: 1, days: [
+    { date: "2026-10-12", state: "ok", items: [
+      { id: "000000000001", section: "top", title: "RAG at scale", url: "https://a.example", why: "Retrieval in production" },
+      { id: "000000000002", section: "repos", title: "org/agent-kit", url: "https://b.example", why: "An Agent toolkit with rag" },
+      { id: "000000000001", section: "try", title: "Try RAG", url: "https://a.example", why: "Build one" }] },
+    { date: "2026-10-11", state: "ok", legacy: true, items: [
+      { id: "000000000001", section: "top", title: "RAG at scale", url: "https://a.example", why: "Repeat" },
+      { id: null, section: "try", title: "Spin up a rag eval", url: null, why: "No link" }] },
+    { date: "2026-10-10", state: "degraded", items: [] }
+  ] }))
+
+  assert.deepStrictEqual(D.dayNeighbours(idx, "2026-10-12"), { older: "2026-10-11", newer: "" }, "newest day")
+  assert.deepStrictEqual(D.dayNeighbours(idx, "2026-10-11"), { older: "2026-10-10", newer: "2026-10-12" }, "middle day")
+  assert.deepStrictEqual(D.dayNeighbours(idx, "2026-10-10"), { older: "", newer: "2026-10-11" }, "oldest day")
+  assert.deepStrictEqual(D.dayNeighbours(idx, "2026-01-01"), { older: "", newer: "" }, "unknown day")
+  assert.deepStrictEqual(D.dayNeighbours(null, "2026-10-12"), { older: "", newer: "" }, "no index")
+
+  const rag = D.search(idx, "rag")
+  assert.deepStrictEqual(rag.map(r => r.date + ":" + r.section), ["2026-10-12:top", "2026-10-12:repos", "2026-10-12:try",
+                                                                  "2026-10-11:top", "2026-10-11:try"], "newest first, title and why")
+  assert.deepStrictEqual(D.search(idx, "  AGENT   Rag ").map(r => r.title), ["org/agent-kit"], "all terms, any case")
+  assert.deepStrictEqual(D.search(idx, "rag zzz"), [], "every term must match")
+  assert.deepStrictEqual(D.search(idx, "   "), [], "blank query")
+  assert.deepStrictEqual(D.search(null, "rag"), [], "no index")
+  const many = D.parseIndex(JSON.stringify({ version: 1, days: [{ date: "2026-10-12", items:
+    Array.from({ length: 80 }, (_, i) => ({ id: null, section: "top", title: "agent " + i, url: null, why: "" })) }] }))
+  assert.strictEqual(D.search(many, "agent").length, 50, "results capped at 50")
+  assert.strictEqual(D.searchRows(rag, "rag")[0].item.meta, "Top stories · 2026-10-12", "result meta")
+  assert.strictEqual(D.searchRows(rag, "rag")[0].item.date, "2026-10-12", "result date")
+  assert.strictEqual(D.searchRows([], "rag")[0].text, "No matches.", "no matches row")
+  assert.strictEqual(D.searchRows([], "")[0].kind, "empty", "prompt row")
+
+  assert.deepStrictEqual(D.jumpTarget(idx, "000000000001", "2026-10-11", "top"), { date: "2026-10-11", section: "top", id: "000000000001" }, "result's own day wins")
+  assert.deepStrictEqual(D.jumpTarget(idx, "000000000001", "2026-10-12", "try"), { date: "2026-10-12", section: "try", id: "000000000001" }, "result's own section wins")
+  assert.deepStrictEqual(D.jumpTarget(idx, "000000000002", "2026-09-01", "repos"), { date: "2026-10-12", section: "repos", id: "000000000002" }, "falls back to the newest day with the id")
+  assert.deepStrictEqual(D.jumpTarget(idx, null, "2026-10-11", "try"), { date: "2026-10-11", section: "try", id: "" }, "no id lands on the day")
+  assert.strictEqual(D.jumpTarget(idx, "ffffffffffff", "2026-10-12", "top"), null, "unknown id")
+}
+
+// --- health and help -------------------------------------------------------------
+
+{
+  const status = D.parseStatus(JSON.stringify({
+    state: "ok", started_at: iso(NOW - minutes(120)), finished_at: iso(NOW - minutes(116)) , prompt_version: "be49fbe55108",
+    model: "sonnet", deduped: 6,
+    feeds: [{ label: "HN", url: "https://hnrss.org/newest", ok: true, kept: 7, error: "", last_ok: iso(NOW - minutes(116)),
+              newest: iso(NOW - minutes(180)), stale: false },
+            { label: "Smol AI News", url: "https://news.smol.ai/rss.xml", ok: true, kept: 0, error: "", last_ok: iso(NOW - minutes(116)),
+              newest: iso(NOW - days(34)), stale: true },
+            { label: "DeepMind", url: "https://deepmind.google/blog/rss.xml", ok: false, kept: 0, error: "HTTP Error 503", last_ok: null }]
+  }))
+  const h = D.healthRows(status, NOW)
+  assert.deepStrictEqual(h.map(r => r.item.title), ["✓ HN", "✓ Smol AI News", "✗ DeepMind"], "feed rows in order")
+  assert.strictEqual(h[0].item.why, "7 kept · last ok 1h ago · newest 3h ago", "feed detail")
+  assert.strictEqual(h[1].item.stale, true, "stale marker")
+  assert.ok(h[1].item.why.indexOf("newest 34d ago") > 0, "stale feed shows its newest date")
+  assert.strictEqual(h[2].item.why, "failed · last ok never\nHTTP Error 503", "failed feed shows its error")
+  assert.strictEqual(h[2].item.url, null, "feed rows open nothing")
+  assert.strictEqual(D.healthRows(null, NOW)[0].kind, "empty", "no status")
+  assert.strictEqual(D.healthSummary(status, NOW), "last run ok · started 2h ago · took 4m 0s · prompt be49fbe55108 · sonnet · 6 deduped", "health summary")
+  assert.strictEqual(D.healthSummary(null, NOW), "No run recorded yet.", "no run")
+  assert.ok(D.helpRows().some(r => r.key === "/" && r.kind === "key"), "help lists the keys")
+}
+
 console.log("digest-test: all checks passed")

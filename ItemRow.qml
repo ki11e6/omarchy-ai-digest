@@ -12,20 +12,24 @@ CursorSurface {
   property int rowIndex: -1
   property bool selected: false
   property bool read: false
+  property bool saved: false
+  property string tryState: ""
+  property color urgentColor: Color.urgent
   property string fontFamily: Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.55)
 
-  signal hovered()
+  signal pointerMoved(Item area, var mouse)
   signal activated()
 
   hasCursor: selected
   implicitHeight: content.implicitHeight + Style.space(12)
 
   MouseArea {
+    id: area
     anchors.fill: parent
     hoverEnabled: true
     cursorShape: row.item && row.item.url ? Qt.PointingHandCursor : Qt.ArrowCursor
-    onEntered: row.hovered()
+    onPositionChanged: function(mouse) { row.pointerMoved(area, mouse) }
     onClicked: row.activated()
   }
 
@@ -46,12 +50,24 @@ CursorSurface {
         textFormat: Text.PlainText
         Layout.fillWidth: true
         text: row.item ? row.item.title : ""
-        color: row.foreground
+        color: row.item && row.item.failed ? row.urgentColor : row.foreground
         font.family: row.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
         wrapMode: Text.WordWrap
         maximumLineCount: 2
+        elide: Text.ElideRight
+      }
+
+      // where a listed item came from (search, saved, try log)
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        visible: text !== ""
+        text: row.item && row.item.meta ? row.item.meta : ""
+        color: row.dim
+        font.family: row.fontFamily
+        font.pixelSize: Style.font.caption
         elide: Text.ElideRight
       }
 
@@ -76,6 +92,9 @@ CursorSurface {
       text: {
         var marks = []
         if (row.item && row.item.unvetted) marks.push("unvetted")
+        if (row.item && row.item.stale) marks.push("stale")
+        if (row.tryState) marks.push(row.tryState)
+        if (row.saved) marks.push("★")
         if (row.read) marks.push("✓")
         return marks.join("  ")
       }

@@ -24,11 +24,15 @@ var MAX_LABEL = 80
 var MAX_URL = 2000
 var MAX_ITEMS = 20
 var MAX_FEEDS = 100
+var MAX_RESULTS = 50
 
 // A run older than this is stalled: TimeoutStartSec 25 min + the 1.5 min stop
 // timeout is 26.5 min, so 30 is safe but tight. Don't lower it.
 var STALL_MS = 30 * 60 * 1000
 var READ_KEEP_MS = 120 * 24 * 3600 * 1000
+
+var TRY_STATES = ["later", "tried", "skipped"]
+var TRY_TITLES = { later: "Later", tried: "Tried", skipped: "Skipped" }
 
 var STATUS_STATES = ["running", "ok", "empty", "degraded", "failed"]
 var DAY_STATES = ["ok", "empty", "degraded"]
@@ -277,7 +281,9 @@ function copyMap(map) {
 // One panel runs per monitor and each writes the whole file, so a load merges
 // what's on disk into memory instead of replacing it: per entry, the newer
 // timestamp wins. `done` is a union (a newer stamp still wins, harmlessly).
-function mergeReader(mine, theirs) {
+// With `nowIso`, the result is pruned as well, so an entry one monitor pruned
+// isn't copied back from another monitor's older file.
+function mergeReader(mine, theirs, nowIso) {
   var out = emptyReader()
   out.extra = copyMap(mine.extra || {})
   var te = theirs.extra || {}
@@ -294,6 +300,12 @@ function mergeReader(mine, theirs) {
     }
     out[name] = merged
   }
+  if (nowIso) {
+    out.read = pruneRead(out.read, nowIso)
+    out.saved = pruneMap(out.saved, nowIso, true)
+    out.tries = pruneMap(out.tries, nowIso, true)
+    out.votes = pruneMap(out.votes, nowIso, true)
+  }
   return out
 }
 
@@ -306,15 +318,34 @@ function withMap(reader, name, map) {
   return out
 }
 
-function pruneRead(read, nowIso) {
+// A removal (unsave, try-state back to none) is stored as a tombstone, not
+// deleted: mergeReader copies over any key the other side lacks, so a deleted
+// entry would come back with the next write from another monitor. The
+// tombstone's newer `at` wins the merge instead.
+function isLive(entry) {
+  return isObject(entry) && entry.removed !== true
+}
+
+function tombstone(nowIso) {
+  return { removed: true, at: nowIso }
+}
+
+// Drops entries older than READ_KEEP_MS: every entry of `read`, only the
+// tombstones of the other maps (a live save is kept however old it is).
+function pruneMap(map, nowIso, onlyTombstones) {
   var now = Date.parse(nowIso)
   var out = {}
-  for (var k in read) {
-    if (!Object.prototype.hasOwnProperty.call(read, k)) continue
-    var t = Date.parse(read[k])
-    if (!isFinite(now) || !isFinite(t) || now - t <= READ_KEEP_MS) out[k] = read[k]
+  for (var k in map) {
+    if (!Object.prototype.hasOwnProperty.call(map, k)) continue
+    var t = stampOf(map[k])
+    var old = isFinite(now) && isFinite(t) && now - t > READ_KEEP_MS
+    if (!old || (onlyTombstones && isLive(map[k]))) out[k] = map[k]
   }
   return out
+}
+
+function pruneRead(read, nowIso) {
+  return pruneMap(read, nowIso, false)
 }
 
 function markRead(reader, id, nowIso) {
@@ -335,6 +366,64 @@ function isRead(reader, id) {
 
 function isUnread(newestDate, reader) {
   return !!newestDate && !(reader && Object.prototype.hasOwnProperty.call(reader.done || {}, newestDate))
+}
+
+function entryOf(reader, name, id) {
+  if (!id || !reader || !isObject(reader[name])) return null
+  var e = reader[name][id]
+  return isLive(e) ? e : null
+}
+
+function isSaved(reader, id) {
+  return entryOf(reader, "saved", id) !== null
+}
+
+function tryState(reader, id) {
+  var e = entryOf(reader, "tries", id)
+  return e && TRY_STATES.indexOf(e.state) >= 0 ? e.state : ""
+}
+
+// Items are keyed by id (sha1 of the URL), so an item without a link (a
+// legacy Worth trying) can't be saved or tracked; the reader is returned as is.
+function toggleSaved(reader, item, nowIso) {
+  if (!item || !item.id) return reader
+  var saved = pruneMap(reader.saved || {}, nowIso, true)
+  saved[item.id] = isSaved(reader, item.id)
+    ? tombstone(nowIso)
+    : { title: item.title, url: item.url, date: item.date || "", section: item.section, at: nowIso }
+  return withMap(reader, "saved", saved)
+}
+
+// later → tried → skipped → none
+function cycleTry(reader, item, nowIso) {
+  if (!item || !item.id) return reader
+  var next = TRY_STATES[TRY_STATES.indexOf(tryState(reader, item.id)) + 1]
+  var tries = pruneMap(reader.tries || {}, nowIso, true)
+  tries[item.id] = next
+    ? { state: next, title: item.title, url: item.url, date: item.date || "", section: item.section, at: nowIso }
+    : tombstone(nowIso)
+  return withMap(reader, "tries", tries)
+}
+
+// Live entries of a reader map, sanitized (reader.json is a file like any
+// other), newest first.
+function entryList(map) {
+  var out = []
+  for (var id in map) {
+    if (!Object.prototype.hasOwnProperty.call(map, id) || !isLive(map[id]) || !cleanId(id)) continue
+    var e = map[id]
+    var title = cleanText(e.title, MAX_TITLE)
+    if (!title) continue
+    out.push({ id: id, title: title, url: cleanUrl(e.url), date: cleanDate(e.date) || "",
+               section: SECTIONS.indexOf(e.section) >= 0 ? e.section : "top",
+               state: TRY_STATES.indexOf(e.state) >= 0 ? e.state : "", at: stampOf(e) })
+  }
+  out.sort(function(a, b) { return b.at - a.at })
+  return out
+}
+
+function savedList(reader) {
+  return entryList(reader && isObject(reader.saved) ? reader.saved : {})
 }
 
 // --- bar ------------------------------------------------------------------
@@ -366,7 +455,8 @@ function freshness(thenMs, nowMs) {
 // --- panel rows -------------------------------------------------------------
 
 function rowItem(section, id, title, why, url, extra) {
-  var item = { id: id, section: section, title: title, why: why, url: url, source: "", unvetted: false }
+  var item = { id: id, section: section, title: title, why: why, url: url, source: "", unvetted: false,
+               date: "", meta: "" }
   for (var k in extra) item[k] = extra[k]
   return item
 }
@@ -391,20 +481,20 @@ function rows(digest, showSkipped) {
     if (digest.note) out.push({ kind: "note", section: "top", text: digest.note })
     for (var i = 0; i < digest.top.length; i++) {
       var s = digest.top[i]
-      out.push({ kind: "item", section: "top", item: rowItem("top", s.id, s.headline, s.why, s.url, { source: s.source }) })
+      out.push({ kind: "item", section: "top", item: rowItem("top", s.id, s.headline, s.why, s.url, { source: s.source, date: digest.date }) })
     }
   }
   if (digest.repos.length) {
     out.push({ kind: "header", section: "repos", text: SECTION_TITLES.repos })
     for (var j = 0; j < digest.repos.length; j++) {
       var r = digest.repos[j]
-      out.push({ kind: "item", section: "repos", item: rowItem("repos", r.id, r.name, r.why, r.url, { unvetted: r.unvetted }) })
+      out.push({ kind: "item", section: "repos", item: rowItem("repos", r.id, r.name, r.why, r.url, { unvetted: r.unvetted, date: digest.date }) })
     }
   }
   if (digest["try"]) {
     var t = digest["try"]
     out.push({ kind: "header", section: "try", text: SECTION_TITLES["try"] })
-    out.push({ kind: "item", section: "try", item: rowItem("try", t.id, t.title, t.what_to_do, t.url, {}) })
+    out.push({ kind: "item", section: "try", item: rowItem("try", t.id, t.title, t.what_to_do, t.url, { date: digest.date }) })
   }
   if (showSkipped && digest.skipped) {
     out.push({ kind: "header", section: "skipped", text: SECTION_TITLES.skipped })
@@ -473,6 +563,175 @@ function findRow(list, section, id) {
   return -1
 }
 
+// --- history and search -----------------------------------------------------
+
+// `[` / `]`: the days either side of `date` in the index (newest first).
+function dayNeighbours(index, date) {
+  var days = index ? index.days : []
+  for (var i = 0; i < days.length; i++) {
+    if (days[i].date !== date) continue
+    return { older: i + 1 < days.length ? days[i + 1].date : "", newer: i > 0 ? days[i - 1].date : "" }
+  }
+  return { older: "", newer: "" }
+}
+
+// In-memory filter over index.json: every whitespace-separated term must
+// appear in the title or why, case-insensitively. Newest first, capped.
+function search(index, query) {
+  var terms = String(query || "").toLowerCase().split(/\s+/).filter(function(t) { return t !== "" })
+  if (!index || !terms.length) return []
+  var out = []
+  for (var i = 0; i < index.days.length; i++) {
+    var day = index.days[i]
+    for (var j = 0; j < day.items.length; j++) {
+      var it = day.items[j]
+      var hay = (it.title + " " + it.why).toLowerCase()
+      var all = true
+      for (var t = 0; t < terms.length && all; t++) all = hay.indexOf(terms[t]) >= 0
+      if (!all) continue
+      out.push({ date: day.date, id: it.id, section: it.section, title: it.title, url: it.url, why: it.why })
+      if (out.length >= MAX_RESULTS) return out
+    }
+  }
+  return out
+}
+
+// `g` on a search result: the day and row to land on. Ids repeat across days
+// by design, so the result's own day wins; within a day the same id can sit
+// in two sections (a story that is also the try item), so its section wins.
+// An item without an id (legacy try) still lands on its day.
+function jumpTarget(index, id, date, section) {
+  var days = index ? index.days : []
+  var fallback = null
+  for (var i = 0; i < days.length; i++) {
+    var d = days[i]
+    if (!id) {
+      if (d.date === date) return { date: date, section: section || "", id: "" }
+      continue
+    }
+    var hit = null
+    for (var j = 0; j < d.items.length; j++) {
+      if (d.items[j].id !== id) continue
+      if (!hit || d.items[j].section === section) hit = { date: d.date, section: d.items[j].section, id: id }
+    }
+    if (hit && d.date === date) return hit
+    if (hit && !fallback) fallback = hit
+  }
+  return fallback
+}
+
+// --- other views ----------------------------------------------------------------
+
+function itemMeta(section, date) {
+  return [SECTION_TITLES[section] || "", date || ""].filter(function(s) { return s !== "" }).join(" · ")
+}
+
+function searchRows(results, query) {
+  if (!String(query || "").trim()) return [{ kind: "empty", section: "", text: "Type to search every digest in the archive." }]
+  if (!results.length) return [{ kind: "empty", section: "", text: "No matches." }]
+  var out = []
+  for (var i = 0; i < results.length; i++) {
+    var r = results[i]
+    out.push({ kind: "item", section: "results",
+               item: rowItem(r.section, r.id, r.title, r.why, r.url, { date: r.date, meta: itemMeta(r.section, r.date) }) })
+  }
+  return out
+}
+
+function listRow(e, group) {
+  return { kind: "item", section: group, item: rowItem(e.section, e.id, e.title, "", e.url, { date: e.date, meta: itemMeta(e.section, e.date) }) }
+}
+
+function savedRows(reader) {
+  var list = savedList(reader)
+  if (!list.length) return [{ kind: "empty", section: "", text: "Nothing saved yet. Press s on an item to save it." }]
+  return list.map(function(e) { return listRow(e, "saved") })
+}
+
+function triesRows(reader) {
+  var list = entryList(reader && isObject(reader.tries) ? reader.tries : {})
+  var out = []
+  for (var i = 0; i < TRY_STATES.length; i++) {
+    var state = TRY_STATES[i]
+    var group = list.filter(function(e) { return e.state === state })
+    if (!group.length) continue
+    out.push({ kind: "header", section: state, text: TRY_TITLES[state] })
+    for (var j = 0; j < group.length; j++) out.push(listRow(group[j], state))
+  }
+  return out.length ? out : [{ kind: "empty", section: "", text: "Nothing tracked yet. Press t on an item: later, tried, skipped." }]
+}
+
+function stampText(iso, nowMs) {
+  var ms = Date.parse(iso || "")
+  return isFinite(ms) ? freshness(ms, nowMs) : "never"
+}
+
+// One row per feed, in feeds.txt order. No url: Enter on a feed row has
+// nothing useful to open (it's an RSS document).
+function healthRows(status, nowMs) {
+  if (!status || !status.feeds.length) return [{ kind: "empty", section: "", text: "No feed health recorded yet. It is written on every run." }]
+  var out = []
+  for (var i = 0; i < status.feeds.length; i++) {
+    var f = status.feeds[i]
+    var parts = [f.ok ? (f.kept !== null ? f.kept + " kept" : "ok") : "failed", "last ok " + stampText(f.last_ok, nowMs)]
+    // a failed fetch says nothing about how fresh the feed is
+    if (f.ok) parts.push("newest " + (f.newest ? stampText(f.newest, nowMs) : "undated"))
+    var detail = parts.join(" · ")
+    if (f.error) detail += "\n" + f.error
+    out.push({ kind: "item", section: "feeds",
+               item: rowItem("feeds", null, (f.ok ? "✓ " : "✗ ") + (f.label || f.url || "feed"), detail, null,
+                             { stale: f.stale, failed: !f.ok }) })
+  }
+  return out
+}
+
+function duration(ms) {
+  var s = Math.max(0, Math.round(ms / 1000))
+  return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s"
+}
+
+// The health view's header line: the last run, from status.json.
+function healthSummary(status, nowMs) {
+  if (!status) return "No run recorded yet."
+  var parts = ["last run " + status.state]
+  var started = Date.parse(status.started_at || "")
+  var finished = Date.parse(status.finished_at || "")
+  if (isFinite(started)) parts.push("started " + freshness(started, nowMs))
+  if (isFinite(started) && isFinite(finished)) parts.push("took " + duration(finished - started))
+  if (status.prompt_version) parts.push("prompt " + status.prompt_version)
+  if (status.model) parts.push(status.model)
+  if (status.deduped !== null) parts.push(status.deduped + " deduped")
+  return parts.join(" · ")
+}
+
+var KEYS = [
+  ["j / k", "move"], ["Tab, 1-4", "next section, jump to section"], ["Enter, o", "open link (marks it read)"],
+  ["c", "copy link"], ["a", "ask your agent about it"], ["s", "save / unsave"], ["t", "try: later → tried → skipped → none"],
+  ["[ / ]", "older / newer day"], ["T", "back to the newest day"], ["/", "search the archive (g: go to that day)"],
+  ["S", "saved items"], ["E", "export saved items to saved.md"], ["L", "try log"], ["H", "feed health"],
+  ["e", "edit the day's .md (in H: feeds.txt)"], ["r", "run the digest now"], ["m", "mark the day done"],
+  ["?", "this help"], ["Esc", "back, then close"]
+]
+
+function helpRows() {
+  return KEYS.map(function(k) { return { kind: "key", section: "", key: k[0], text: k[1] } })
+}
+
+// ~/ai-digest/saved.md. Titles come from feeds, so link syntax in them is
+// escaped; parentheses in URLs are percent-encoded so they can't end the link.
+function savedMarkdown(reader) {
+  var lines = ["# Saved from AI digest", ""]
+  var list = savedList(reader)
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i]
+    var title = e.title.replace(/[\\\[\]]/g, "\\$&")
+    var link = e.url ? "[" + title + "](" + e.url.replace(/\(/g, "%28").replace(/\)/g, "%29") + ")" : title
+    lines.push("- " + link + " — " + itemMeta(e.section, e.date).replace(" · ", ", "))
+  }
+  if (!list.length) lines.push("Nothing saved.")
+  return lines.join("\n") + "\n"
+}
+
 // --- text -----------------------------------------------------------------
 
 function agentPrompt(item) {
@@ -508,7 +767,9 @@ function headerFacts(digest, status) {
 if (typeof module !== "undefined") {
   module.exports = {
     SECTIONS: SECTIONS,
+    SECTION_TITLES: SECTION_TITLES,
     STALL_MS: STALL_MS,
+    MAX_RESULTS: MAX_RESULTS,
     cleanText: cleanText,
     cleanUrl: cleanUrl,
     parseDigest: parseDigest,
@@ -522,6 +783,11 @@ if (typeof module !== "undefined") {
     markDone: markDone,
     isRead: isRead,
     isUnread: isUnread,
+    isSaved: isSaved,
+    tryState: tryState,
+    toggleSaved: toggleSaved,
+    cycleTry: cycleTry,
+    savedList: savedList,
     barState: barState,
     isUrgent: isUrgent,
     freshness: freshness,
@@ -531,6 +797,16 @@ if (typeof module !== "undefined") {
     nextSection: nextSection,
     moveCursor: moveCursor,
     findRow: findRow,
+    dayNeighbours: dayNeighbours,
+    search: search,
+    jumpTarget: jumpTarget,
+    searchRows: searchRows,
+    savedRows: savedRows,
+    triesRows: triesRows,
+    healthRows: healthRows,
+    healthSummary: healthSummary,
+    helpRows: helpRows,
+    savedMarkdown: savedMarkdown,
     agentPrompt: agentPrompt,
     headerFacts: headerFacts
   }

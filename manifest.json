@@ -13,6 +13,13 @@
     "description": "Daily AI digest. Enter opens, a asks your agent, r runs the digest now.",
     "category": "News",
     "defaultSection": "right",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaults": { "digestDir": "", "showSkipped": true, "unreadDot": true },
+    "schema": [
+      { "key": "digestDir", "type": "path", "label": "Digest folder", "defaultValue": "",
+        "description": "Where ai-digest writes daily files. Empty means ~/ai-digest." },
+      { "key": "showSkipped", "type": "boolean", "label": "Show the Skipped line", "defaultValue": true },
+      { "key": "unreadDot", "type": "boolean", "label": "Show a dot for an unread digest", "defaultValue": true }
+    ]
   }
 }
