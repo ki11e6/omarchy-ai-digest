@@ -350,6 +350,12 @@ Panel {
     updateReader(Digest.cycleTry(reader, item, nowIso()))
   }
 
+  function voteItem(item, vote) {
+    if (!item || view === "health") return
+    if (!item.id) { notice = "This item has no link, so it can't be voted on."; return }
+    updateReader(Digest.toggleVote(reader, item, vote, nowIso()))
+  }
+
   function exportSaved() {
     exportCount = Digest.savedList(reader).length
     exportFile.setText(Digest.savedMarkdown(reader))
@@ -380,6 +386,8 @@ Panel {
     else if (t === "a") askItem(item)
     else if (t === "s") saveItem(item)
     else if (t === "t") cycleTryItem(item)
+    else if (t === "+") voteItem(item, 1)
+    else if (t === "-") voteItem(item, -1)
     else if (t === "E") exportSaved()
     else if (t === "e") editDay()
     else if (t === "r") runNow()
@@ -742,6 +750,7 @@ Panel {
                   read: visible && Digest.isRead(root.reader, slot.modelData.item.id)
                   saved: visible && Digest.isSaved(root.reader, slot.modelData.item.id)
                   tryState: visible ? Digest.tryState(root.reader, slot.modelData.item.id) : ""
+                  vote: visible ? Digest.voteOf(root.reader, slot.modelData.item.id) : 0
                   foreground: root.foreground
                   urgentColor: root.urgentColor
                   fontFamily: root.fontFamily

@@ -36,6 +36,7 @@ quiet for longer than usual) don't change the icon; they're listed in the panel.
 | `s` / `S` | save / unsave the item; the saved list |
 | `E` | export the saved list to `~/ai-digest/saved.md` |
 | `t` / `L` | try-state: later → tried → skipped → none; the try log |
+| `+` / `-` | vote the item up / down (again to clear); the service passes recent votes to the next digest as weak hints |
 | `[` / `]`, `T` | older / newer day; back to the newest |
 | `/` | search every digest in the archive; `g` on a result goes to that day |
 | `H` | feed health: each feed's last fetch, newest item, stale marker, error |
@@ -60,7 +61,7 @@ o.bind("SUPER + ALT + D", "AI digest", "omarchy-shell shell toggle io.github.ki1
 | `~/ai-digest/index.json` | service | which day is newest, history, search |
 | `~/ai-digest/YYYY-MM-DD.json` | service | the day shown |
 | `~/ai-digest/YYYY-MM-DD.md` | service | `e`, and days without JSON (shown as plain text) |
-| `~/.local/state/ai-digest/reader.json` | this plugin | read items, done days, saved items, try-states |
+| `~/.local/state/ai-digest/reader.json` | this plugin | read items, done days, saved items, try-states, votes |
 | `~/ai-digest/saved.md` | this plugin, on `E` | the saved list as markdown links |
 
 The bar runs one copy of the widget per monitor. Each copy watches

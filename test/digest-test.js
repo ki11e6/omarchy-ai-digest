@@ -373,6 +373,24 @@ assert.strictEqual(D.freshness(NOW + minutes(5), NOW), "just now", "clock skew c
   assert.strictEqual(D.tryState(D.mergeReader(later, none), item.id), "", "try removal survives a merge")
   assert.strictEqual(D.tryState(r0, item.id), "", "cycleTry doesn't mutate")
 
+  // toggleVote: + / - set the vote, the same key again clears it
+  const up = D.toggleVote(r0, item, 1, iso(NOW))
+  assert.strictEqual(D.voteOf(up, item.id), 1, "+ votes up")
+  assert.deepStrictEqual(up.votes[item.id], { vote: 1, title: "Story 1", section: "top", date: "2026-10-12", at: iso(NOW) },
+                         "vote entry shape")
+  assert.deepStrictEqual(r0.votes, {}, "toggleVote doesn't mutate")
+  const down = D.toggleVote(up, item, -1, iso(NOW + 1000))
+  assert.strictEqual(D.voteOf(down, item.id), -1, "- flips an up vote down")
+  const cleared = D.toggleVote(down, item, -1, iso(NOW + 2000))
+  assert.strictEqual(D.voteOf(cleared, item.id), 0, "- again clears it")
+  assert.deepStrictEqual(cleared.votes[item.id], { removed: true, at: iso(NOW + 2000) }, "a cleared vote is a tombstone")
+  assert.strictEqual(D.voteOf(D.toggleVote(cleared, item, 1, iso(NOW + 3000)), item.id), 1, "+ after clearing votes again")
+  assert.strictEqual(D.voteOf(D.mergeReader(cleared, up), item.id), 0, "cleared vote survives a merge with an older vote")
+  assert.strictEqual(D.toggleVote(r0, Object.assign({}, item, { id: null }), 1, iso(NOW)), r0, "no id, no vote")
+  assert.strictEqual(D.toggleVote(r0, item, 0, iso(NOW)), r0, "only 1 / -1 are votes")
+  assert.strictEqual(D.voteOf(Object.assign(D.emptyReader(), { votes: { [item.id]: { vote: 5, at: iso(NOW) } } }), item.id), 0,
+                     "a malformed vote reads as none")
+
   // tombstones and read stamps age out with the 120-day rule, also through a merge
   const oldTomb = Object.assign(D.emptyReader(), {
     saved: { aaaaaaaaaaaa: { removed: true, at: iso(NOW - days(121)) },

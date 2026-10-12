@@ -405,6 +405,22 @@ function cycleTry(reader, item, nowIso) {
   return withMap(reader, "tries", tries)
 }
 
+function voteOf(reader, id) {
+  var e = entryOf(reader, "votes", id)
+  return e && (e.vote === 1 || e.vote === -1) ? e.vote : 0
+}
+
+// `+` / `-`: set the vote to 1 / -1; the same key again clears it. The
+// service reads these (with their titles) as weak signals for the next digest.
+function toggleVote(reader, item, vote, nowIso) {
+  if (!item || !item.id || (vote !== 1 && vote !== -1)) return reader
+  var votes = pruneMap(reader.votes || {}, nowIso, true)
+  votes[item.id] = voteOf(reader, item.id) === vote
+    ? tombstone(nowIso)
+    : { vote: vote, title: item.title, section: item.section, date: item.date || "", at: nowIso }
+  return withMap(reader, "votes", votes)
+}
+
 // Live entries of a reader map, sanitized (reader.json is a file like any
 // other), newest first.
 function entryList(map) {
@@ -707,6 +723,7 @@ function healthSummary(status, nowMs) {
 var KEYS = [
   ["j / k", "move"], ["Tab, 1-4", "next section, jump to section"], ["Enter, o", "open link (marks it read)"],
   ["c", "copy link"], ["a", "ask your agent about it"], ["s", "save / unsave"], ["t", "try: later → tried → skipped → none"],
+  ["+ / -", "vote up / down (again to clear); steers the next digests"],
   ["[ / ]", "older / newer day"], ["T", "back to the newest day"], ["/", "search the archive (g: go to that day)"],
   ["S", "saved items"], ["E", "export saved items to saved.md"], ["L", "try log"], ["H", "feed health"],
   ["e", "edit the day's .md (in H: feeds.txt)"], ["r", "run the digest now"], ["m", "mark the day done"],
@@ -787,6 +804,8 @@ if (typeof module !== "undefined") {
     tryState: tryState,
     toggleSaved: toggleSaved,
     cycleTry: cycleTry,
+    voteOf: voteOf,
+    toggleVote: toggleVote,
     savedList: savedList,
     barState: barState,
     isUrgent: isUrgent,

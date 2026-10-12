@@ -14,6 +14,7 @@ CursorSurface {
   property bool read: false
   property bool saved: false
   property string tryState: ""
+  property int vote: 0
   property color urgentColor: Color.urgent
   property string fontFamily: Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -94,6 +95,7 @@ CursorSurface {
         if (row.item && row.item.unvetted) marks.push("unvetted")
         if (row.item && row.item.stale) marks.push("stale")
         if (row.tryState) marks.push(row.tryState)
+        if (row.vote) marks.push(row.vote > 0 ? "▲" : "▼")
         if (row.saved) marks.push("★")
         if (row.read) marks.push("✓")
         return marks.join("  ")
