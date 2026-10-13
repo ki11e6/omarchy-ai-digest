@@ -114,6 +114,14 @@ assert.strictEqual(parse(day({ state: "weird" })).state, "ok", "unknown day stat
   assert.strictEqual(done.feeds[1].stale, false, "missing stale is false")
   assert.strictEqual(D.parseStatus(JSON.stringify({ state: "bogus" })).state, "unknown", "unknown status state")
   assert.strictEqual(D.parseStatus(""), null, "empty status")
+
+  assert.strictEqual(D.statusWarning("", null), "", "no status file is not a warning")
+  assert.strictEqual(D.statusWarning("  \n", null), "", "empty status file is not a warning")
+  assert.ok(D.statusWarning('{"state": "ok"', null).includes("unreadable"), "truncated status warns")
+  assert.ok(D.statusWarning("[]", D.parseStatus("[]")).includes("unreadable"), "non-object status warns")
+  const bogus = '{"state": "bogus"}'
+  assert.ok(D.statusWarning(bogus, D.parseStatus(bogus)).includes("unrecognised"), "unknown state warns")
+  assert.strictEqual(D.statusWarning("x", done), "", "valid status has no warning")
 }
 
 {

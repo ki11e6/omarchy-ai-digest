@@ -26,6 +26,7 @@ Panel {
   readonly property bool unreadDot: setting("unreadDot", true) === true
 
   property var status: null
+  property string statusWarning: ""
   property var archiveIndex: null
   property var digest: null
   property var weekly: null
@@ -37,6 +38,11 @@ Panel {
   property bool readerDirty: false
   property bool savingNow: false
   property string readerWarning: ""
+
+  // `r`: set until status.json next changes or systemctl refuses the start
+  property bool runRequested: false
+  property string runWarning: ""
+  property string runStderr: ""
 
   property double nowMs: Date.now()
   property int cursorIndex: -1
@@ -127,15 +133,16 @@ Panel {
   }
 
   readonly property string urgentText: {
+    var retry = "\nPress r to run it again."
     if (barState === "stalled") {
       var started = status ? Date.parse(status.started_at || "") : NaN
       return "The digest run started " + (isFinite(started) ? Digest.freshness(started, nowMs) : "a while ago")
-        + " and hasn't finished."
+        + " and hasn't finished." + retry
     }
     var failed = facts.failed.length ? "Unreachable: " + facts.failed.join(", ") : ""
     if (barState === "failed")
-      return "Last run failed: " + (facts.error || "unknown error") + (failed ? "\n" + failed : "")
-    if (barState === "degraded") return failed || "Most feeds were unreachable."
+      return "Last run failed: " + (facts.error || "unknown error") + (failed ? "\n" + failed : "") + retry
+    if (barState === "degraded") return (failed || "Most feeds were unreachable.") + retry
     return ""
   }
 
@@ -146,6 +153,7 @@ Panel {
     if (view === "health") lines.push(Digest.healthSummary(status, nowMs))
     if (view === "digest" && !urgent && facts.failed.length) lines.push("failed: " + facts.failed.join(", "))
     if (view === "digest" && facts.stale.length) lines.push("stale: " + facts.stale.join(", "))
+    if (runRequested) lines.push("Starting the digest…")
     if (notice) lines.push(notice)
     return lines.join("\n")
   }
@@ -184,7 +192,7 @@ Panel {
   function loadReader(raw) {
     var parsed = Digest.parseReader(raw)
     if (parsed === null) {
-      readerWarning = "reader.json is unreadable; starting with empty reader state."
+      readerWarning = "reader.json is unreadable; starting with empty reader state. Your next change replaces the file."
     } else {
       reader = Digest.mergeReader(reader, parsed, nowIso())
       readerWarning = ""
@@ -379,8 +387,11 @@ Panel {
   }
 
   function runNow() {
-    if (barState === "running") return
-    Util.execArgv(["systemctl", "--user", "start", "--no-block", "ai-digest.service"])
+    if (barState === "running" || runner.running) return
+    runWarning = ""
+    runStderr = ""
+    runRequested = true
+    runner.running = true
   }
 
   function markDayDone() {
@@ -445,14 +456,44 @@ Panel {
     printErrors: false
     onFileChanged: reload()
     onLoaded: {
-      root.status = Digest.parseStatus(text())
+      var raw = text()
+      root.status = Digest.parseStatus(raw)
+      root.statusWarning = Digest.statusWarning(raw, root.status)
+      // any write means the service has reported, even a run that failed
+      // before this instance saw it as `running`
+      root.runRequested = false
       root.nowMs = Date.now()
       indexFile.reload()
       dayFile.reload()
       weeklyFile.reload()
       if (root.useMarkdown) mdFile.reload()
     }
-    onLoadFailed: function(error) { root.status = null }
+    onLoadFailed: function(error) {
+      root.status = null
+      root.statusWarning = error === FileViewError.FileNotFound
+        ? "" : "Can't read status.json (" + FileViewError.toString(error) + ")."
+    }
+  }
+
+  // `r`. Util.execArgv is detached and never reports back, so a missing unit
+  // or a refused start would look like nothing happened. --no-block returns
+  // once the job is queued; the service's own status.json takes it from there.
+  Process {
+    id: runner
+    command: ["systemctl", "--user", "start", "--no-block", "ai-digest.service"]
+    // the exit can land before the collector; whichever comes second has both
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.runStderr = String(text || "").trim().slice(0, 300)
+        if (root.runWarning !== "" && root.runStderr !== "") root.runWarning = "Couldn't start ai-digest.service: " + root.runStderr
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) return
+      root.runRequested = false
+      root.runWarning = "Couldn't start ai-digest.service" + (root.runStderr !== "" ? ": " + root.runStderr : " (exit " + exitCode + ").")
+    }
   }
 
   FileView {
@@ -661,7 +702,7 @@ Panel {
           textFormat: Text.PlainText
           visible: text !== ""
           width: parent.width
-          text: [root.urgentText, root.readerWarning].filter(function(s) { return s !== "" }).join("\n")
+          text: [root.urgentText, root.statusWarning, root.runWarning, root.readerWarning].filter(function(s) { return s !== "" }).join("\n")
           color: root.urgentColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall

@@ -236,6 +236,16 @@ function parseStatus(raw) {
   }
 }
 
+// A missing or empty status.json just means no run yet; one that's there but
+// can't be read would otherwise look exactly like that and hide a failed run.
+function statusWarning(raw, status) {
+  if (status === null) {
+    return typeof raw === "string" && raw.trim() !== ""
+      ? "status.json is unreadable, so the last run's state is unknown." : ""
+  }
+  return status.state === "unknown" ? "status.json has an unrecognised run state." : ""
+}
+
 function parseIndex(raw) {
   var x = parseJson(raw)
   if (!isObject(x) || !Array.isArray(x.days)) return null
@@ -871,6 +881,7 @@ if (typeof module !== "undefined") {
     cleanUrl: cleanUrl,
     parseDigest: parseDigest,
     parseStatus: parseStatus,
+    statusWarning: statusWarning,
     parseIndex: parseIndex,
     parseWeekly: parseWeekly,
     emptyReader: emptyReader,
